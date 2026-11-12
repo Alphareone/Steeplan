@@ -1,2 +1,8 @@
 # Steeplan
-Idea para desarrollar un software de videollamadas y organización optimizada y ligera
+Entorno colaborativo ligero de comunicación, planificación y flujo optimizado para equipos TI.
+
+## Inicio Rápido
+```bash
+npm install
+npm run dev
+```
