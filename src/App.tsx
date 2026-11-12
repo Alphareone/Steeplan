@@ -1,7 +1,7 @@
-import { useState } from 'react';
-import { Hash, Volume2, LayoutGrid, MessageSquare, Plus, CheckCircle2, Sparkles, ShieldCheck } from 'lucide-react';
-import { WORKSPACES, CHANNELS, INITIAL_ITEMS } from './data/mockData';
-import { ViewMode, WorkItem, SpecialtyRole } from './types/steeplan';
+import { useEffect, useState } from 'react';
+import { Hash, Volume2, LayoutGrid, MessageSquare, Plus, CheckCircle2, Sparkles, ShieldCheck, Loader2, Zap, Palette, Bug, AlertTriangle } from 'lucide-react';
+import { supabase, workItemSchema } from './lib/supabase';
+import { ViewMode, WorkItem, SpecialtyRole, Workspace, Channel } from './types/steeplan';
 
 const ROLE_BADGES: Record<SpecialtyRole, { label: string; color: string }> = {
   dev: { label: 'DEV', color: 'bg-blue-500/20 text-blue-300 border-blue-500/30' },
@@ -11,55 +11,124 @@ const ROLE_BADGES: Record<SpecialtyRole, { label: string; color: string }> = {
 };
 
 export function App() {
-  const [activeWsId, setActiveWsId] = useState(WORKSPACES[0].id);
-  const [activeChannelId, setActiveChannelId] = useState(CHANNELS[1].id);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [items, setItems] = useState<WorkItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [dbError, setDbError] = useState<string | null>(null);
+
+  const [activeWsId, setActiveWsId] = useState<string>('');
+  const [activeChannelId, setActiveChannelId] = useState<string>('');
   const [viewMode, setViewMode] = useState<ViewMode>('chat');
-  const [items, setItems] = useState<WorkItem[]>(INITIAL_ITEMS);
   const [inputText, setInputText] = useState('');
   const [itemType, setItemType] = useState<WorkItem['type']>('message');
+  const [isSending, setIsSending] = useState(false);
 
-  const activeWs = WORKSPACES.find((w) => w.id === activeWsId)!;
-  const wsChannels = CHANNELS.filter((c) => c.workspaceId === activeWsId);
+  useEffect(() => {
+    async function loadInitialData() {
+      const [wsRes, chRes, itemsRes] = await Promise.all([
+        supabase.from('workspaces').select('*').order('created_at'),
+        supabase.from('channels').select('*').order('name'),
+        supabase.from('work_items').select('*').order('created_at', { ascending: true }),
+      ]);
+
+      const err = wsRes.error || chRes.error || itemsRes.error;
+      if (err) {
+        setDbError(`${err.code || 'ERROR'}: ${err.message}`);
+      }
+
+      if (wsRes.data && wsRes.data.length > 0) {
+        setWorkspaces(wsRes.data);
+        setActiveWsId(wsRes.data[0].id);
+      }
+      if (chRes.data && chRes.data.length > 0) {
+        setChannels(chRes.data);
+        setActiveChannelId(chRes.data[0].id);
+      }
+      if (itemsRes.data) setItems(itemsRes.data as WorkItem[]);
+      setLoading(false);
+    }
+
+    loadInitialData();
+
+    const subscription = supabase
+      .channel('realtime-work-items')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'work_items' }, (payload) => {
+        setItems((prev) => (prev.some((i) => i.id === payload.new.id) ? prev : [...prev, payload.new as WorkItem]));
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'work_items' }, (payload) => {
+        setItems((prev) => prev.map((i) => (i.id === payload.new.id ? (payload.new as WorkItem) : i)));
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(subscription);
+    };
+  }, []);
+
+  const activeWs = workspaces.find((w) => w.id === activeWsId);
+  const wsChannels = channels.filter((c) => c.workspace_id === activeWsId);
   const activeChannel = wsChannels.find((c) => c.id === activeChannelId) || wsChannels[0];
-  const channelItems = items.filter((item) => item.channelId === activeChannel?.id);
+  const channelItems = items.filter((item) => item.channel_id === activeChannel?.id);
 
-  const handleSend = (e: React.FormEvent) => {
+  const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim() || !activeChannel) return;
+    if (!inputText.trim() || !activeChannel || isSending) return;
 
-    const newItem: WorkItem = {
-      id: Date.now().toString(),
-      channelId: activeChannel.id,
+    const candidate = {
+      channel_id: activeChannel.id,
       author: 'Alphareone',
-      role: 'dev',
+      role: 'dev' as const,
       type: itemType,
       title: itemType !== 'message' ? inputText.slice(0, 45) : undefined,
-      content: inputText,
-      status: 'todo',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      content: inputText.trim(),
+      status: 'todo' as const,
     };
 
-    setItems([...items, newItem]);
-    setInputText('');
+    const parsed = workItemSchema.safeParse(candidate);
+    if (!parsed.success) {
+      setDbError(parsed.error.issues[0].message);
+      return;
+    }
+
+    setIsSending(true);
+    const { data, error } = await supabase.from('work_items').insert(parsed.data).select().single();
+    setIsSending(false);
+
+    if (error) {
+      setDbError(`Error al guardar: ${error.message}`);
+      return;
+    }
+
+    if (data) {
+      setItems((prev) => (prev.some((i) => i.id === data.id) ? prev : [...prev, data as WorkItem]));
+      setInputText('');
+    }
   };
 
-  const toggleStatus = (id: string) => {
-    setItems(items.map((item) => {
-      if (item.id !== id) return item;
-      const next = item.status === 'todo' ? 'doing' : item.status === 'doing' ? 'done' : 'todo';
-      return { ...item, status: next };
-    }));
+  const toggleStatus = async (item: WorkItem) => {
+    const nextStatus = item.status === 'todo' ? 'doing' : item.status === 'doing' ? 'done' : 'todo';
+    setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, status: nextStatus } : i)));
+    await supabase.from('work_items').update({ status: nextStatus }).eq('id', item.id);
   };
+
+  if (loading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-zinc-950 text-zinc-400 gap-2">
+        <Loader2 className="w-5 h-5 animate-spin text-indigo-500" />
+        <span className="text-sm">Conectando espacio de trabajo Steeplan...</span>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-zinc-950 text-zinc-100 font-sans antialiased">
-      {/* COLUMNA 1: Proyectos / Espacios */}
       <aside className="w-18 bg-zinc-950 border-r border-zinc-800/80 flex flex-col items-center py-4 gap-3">
         <div className="w-11 h-11 rounded-2xl bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/20 mb-2">
           <Sparkles className="w-5 h-5" />
         </div>
         <div className="w-8 h-[1px] bg-zinc-800" />
-        {WORKSPACES.map((ws) => (
+        {workspaces.map((ws) => (
           <button
             key={ws.id}
             onClick={() => setActiveWsId(ws.id)}
@@ -75,12 +144,11 @@ export function App() {
         ))}
       </aside>
 
-      {/* COLUMNA 2: Etapas y Canales Guiados */}
       <nav className="w-64 bg-zinc-900/70 border-r border-zinc-800/80 flex flex-col">
         <header className="h-14 px-4 border-b border-zinc-800/80 flex items-center justify-between">
-          <h1 className="font-semibold text-sm tracking-tight truncate">{activeWs.name}</h1>
-          <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">
-            Steeplan
+          <h1 className="font-semibold text-sm tracking-tight truncate">{activeWs?.name || 'Steeplan'}</h1>
+          <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            Live
           </span>
         </header>
 
@@ -120,19 +188,31 @@ export function App() {
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-xs font-medium truncate">Alphareone</p>
-            <p className="text-[11px] text-emerald-400 truncate">● Construyendo MVP</p>
+            <p className="text-[11px] text-emerald-400 truncate flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block" />
+              Conectado a Supabase
+            </p>
           </div>
         </div>
       </nav>
 
-      {/* COLUMNA 3: Área de Trabajo Adaptable */}
       <main className="flex-1 flex flex-col bg-zinc-950 min-w-0">
+        {dbError && (
+          <div className="bg-red-950/90 border-b border-red-800 px-6 py-2.5 text-xs text-red-200 flex items-center justify-between">
+            <span className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+              {dbError}
+            </span>
+            <button onClick={() => setDbError(null)} className="underline ml-4 cursor-pointer">Cerrar</button>
+          </div>
+        )}
+
         <header className="h-14 px-6 border-b border-zinc-800/80 flex items-center justify-between gap-4">
           <div className="flex items-center gap-2 min-w-0">
             <Hash className="w-5 h-5 text-zinc-500 shrink-0" />
-            <h2 className="font-semibold text-sm truncate">{activeChannel?.name}</h2>
+            <h2 className="font-semibold text-sm truncate">{activeChannel?.name || 'Sin canal activo'}</h2>
             <span className="hidden md:inline text-xs text-zinc-500 truncate">
-              — {activeChannel?.description}
+              — {activeChannel?.description || `Workspaces: ${workspaces.length} | Canales: ${channels.length}`}
             </span>
           </div>
 
@@ -172,7 +252,7 @@ export function App() {
                   <ShieldCheck className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
                   <p className="text-sm text-zinc-400">Este canal está listo para comenzar.</p>
                   <p className="text-xs text-zinc-500 mt-1">
-                    Usa las etiquetas inferiores para registrar una tarea, entrega UI/UX o reporte QA.
+                    Todo lo que registres aquí se guardará en tiempo real en PostgreSQL.
                   </p>
                 </div>
               ) : (
@@ -187,12 +267,14 @@ export function App() {
                         <span className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${ROLE_BADGES[item.role].color}`}>
                           {ROLE_BADGES[item.role].label}
                         </span>
-                        <span className="text-[11px] text-zinc-500">{item.timestamp}</span>
+                        <span className="text-[11px] text-zinc-500">
+                          {new Date(item.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
                       </div>
 
                       {item.type !== 'message' && (
                         <button
-                          onClick={() => toggleStatus(item.id)}
+                          onClick={() => toggleStatus(item)}
                           className="flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 cursor-pointer"
                         >
                           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
@@ -221,7 +303,7 @@ export function App() {
                       .map((item) => (
                         <div
                           key={item.id}
-                          onClick={() => toggleStatus(item.id)}
+                          onClick={() => toggleStatus(item)}
                           className="p-3 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-indigo-500/50 cursor-pointer transition-all"
                         >
                           <span className={`text-[10px] px-1.5 py-0.5 rounded border ${ROLE_BADGES[item.role].color}`}>
@@ -255,37 +337,66 @@ export function App() {
           <form onSubmit={handleSend} className="p-4 border-t border-zinc-800/80 bg-zinc-950">
             <div className="max-w-3xl mx-auto flex flex-col gap-2">
               <div className="flex items-center gap-1.5">
-                {(['message', 'task', 'handoff', 'bug'] as const).map((type) => (
-                  <button
-                    key={type}
-                    type="button"
-                    onClick={() => setItemType(type)}
-                    className={`text-[11px] px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
-                      itemType === type
-                        ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-300 font-medium'
-                        : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                    }`}
-                  >
-                    {type === 'message' && '💬 Mensaje'}
-                    {type === 'task' && '⚡ Tarea Dev'}
-                    {type === 'handoff' && '🎨 Entrega UI/UX'}
-                    {type === 'bug' && '🐞 Reporte QA'}
-                  </button>
-                ))}
+                <button
+                  type="button"
+                  onClick={() => setItemType('message')}
+                  className={`flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
+                    itemType === 'message'
+                      ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-300 font-medium'
+                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <MessageSquare className="w-3 h-3" /> Mensaje
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setItemType('task')}
+                  className={`flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
+                    itemType === 'task'
+                      ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-300 font-medium'
+                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <Zap className="w-3 h-3" /> Tarea Dev
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setItemType('handoff')}
+                  className={`flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
+                    itemType === 'handoff'
+                      ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-300 font-medium'
+                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <Palette className="w-3 h-3" /> Entrega UI/UX
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setItemType('bug')}
+                  className={`flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
+                    itemType === 'bug'
+                      ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-300 font-medium'
+                      : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <Bug className="w-3 h-3" /> Reporte QA
+                </button>
               </div>
               <div className="flex gap-2">
                 <input
                   type="text"
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
-                  placeholder={`Registrar ${itemType} en #${activeChannel?.name}...`}
-                  className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+                  disabled={isSending}
+                  placeholder={`Registrar ${itemType} en #${activeChannel?.name || 'canal'}...`}
+                  className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
                 />
                 <button
                   type="submit"
-                  className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium flex items-center gap-1.5 cursor-pointer"
+                  disabled={isSending}
+                  className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm font-medium flex items-center gap-1.5 cursor-pointer"
                 >
-                  <Plus className="w-4 h-4" /> Enviar
+                  <Plus className="w-4 h-4" /> {isSending ? 'Guardando...' : 'Enviar'}
                 </button>
               </div>
             </div>

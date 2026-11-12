@@ -10,7 +10,7 @@ export interface Workspace {
 
 export interface Channel {
   id: string;
-  workspaceId: string;
+  workspace_id: string;
   name: string;
   category: 'Planificación' | 'Diseño & UX' | 'Desarrollo' | 'Calidad & Voz';
   description: string;
@@ -18,12 +18,12 @@ export interface Channel {
 
 export interface WorkItem {
   id: string;
-  channelId: string;
+  channel_id: string;
   author: string;
   role: SpecialtyRole;
   type: 'message' | 'task' | 'handoff' | 'bug';
-  title?: string;
+  title?: string | null;
   content: string;
   status: 'todo' | 'doing' | 'done';
-  timestamp: string;
+  created_at: string;
 }
